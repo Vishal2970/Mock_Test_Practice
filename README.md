@@ -1,6 +1,6 @@
 # MockLab — Excel-based mock test app
 
-A client-side React + TypeScript single-page application. No backend, database, login, or API is required.
+A client-side React + TypeScript single-page application. Manual Excel uploads require no login, backend, or database. An optional Google Drive source can be configured.
 
 ## Run locally
 1. Install Node.js 18 or newer.
@@ -17,6 +17,16 @@ For a production build:
 npm run build
 npm run preview
 ```
+
+## Optional Google Drive access
+Manual Excel upload works independently and does not require Google sign-in. To enable the optional Drive source:
+1. Enable the Google Drive API in a Google Cloud project and create an OAuth 2.0 Web application client ID. Add the app's local and deployed origins as authorized JavaScript origins.
+2. Copy `.env.example` to `.env.local` and set `VITE_GOOGLE_CLIENT_ID` and `VITE_GOOGLE_DRIVE_ROOT_FOLDER_ID`. The configured root must be a Google Drive folder shared with the signed-in accounts. Restart Vite after changing environment variables.
+3. Sign in from the dashboard. The app checks access to the configured folder using the authenticated account, then lists only folders and `.xls`/`.xlsx` files that account can read. Drive access is read-only and uses the `drive.readonly` OAuth scope.
+
+For GitHub Pages, add `VITE_GOOGLE_CLIENT_ID` and `VITE_GOOGLE_DRIVE_ROOT_FOLDER_ID` as repository Actions variables under **Settings → Secrets and variables → Actions → Variables**. The deploy workflow passes them to Vite during the build. In Google Cloud, add the deployed site's origin (for example, `https://<username>.github.io`, without the repository path) to the OAuth client's authorized JavaScript origins.
+
+Drive access tokens are held in memory only, are not written to localStorage, and are revoked when signing out. The current folder listing refreshes automatically every 60 seconds; an imported Drive workbook is re-downloaded and parsed through the same Excel pipeline when its Drive modification time changes. A new sign-in is required after token expiry. Google sign-in, API, or permission failures do not disable manual upload.
 
 ## Excel workbook format
 Each worksheet becomes a subject (section). The worksheet tab name is the subject name; the workbook filename is ignored. Hidden and empty worksheets are skipped and listed in the import details.
@@ -48,7 +58,7 @@ A sample workbook can be downloaded from inside the app.
 - **Excel export:** sheets *Question Review*, *Subject Analysis* (original columns first, new ones appended) and *Overall Summary*.
 
 ## Privacy and storage
-The workbook and results are processed in the browser and saved in this browser's localStorage. They are not uploaded to a server. Clearing browser site data removes saved data. Browser storage is not a substitute for a backup.
+The workbook and results are processed in the browser and saved in this browser's localStorage. They are not uploaded to an app server. When Google Drive is selected, the chosen workbook is downloaded directly from Drive to the browser with the signed-in account's read-only authorization. Clearing browser site data removes saved data. Browser storage is not a substitute for a backup.
 
 ## Notes
 - The app supports four options per question.

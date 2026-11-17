@@ -1,12 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import * as XLSX from 'xlsx';
-import { Upload, FileSpreadsheet, Clock3, Play, CheckCircle2, Flag, ChevronLeft, ChevronRight, Send, RotateCcw, Download, Trash2, X, AlertCircle, BookOpen, BarChart3, Timer, Shuffle, Home, Keyboard, Lock, Maximize, Minimize, Eraser, TriangleAlert } from 'lucide-react';
+import { Upload, FileSpreadsheet, Clock3, Play, CheckCircle2, Flag, ChevronLeft, ChevronRight, Send, RotateCcw, Download, Trash2, X, AlertCircle, BookOpen, BarChart3, Timer, Shuffle, Home, Keyboard, Lock, Maximize, Minimize, Eraser, TriangleAlert, Cloud, Folder, RefreshCw, LogOut } from 'lucide-react';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from 'recharts';
 import * as E from './examEngine';
 import type { Question, Subject, ExamSession, ExamConfig, TestResult, RawSheet, ImportReport, AnswerState, TimingMode } from './examEngine';
+import { downloadDriveFile, DriveApiError, GoogleAuthCancelledError, getDriveFile, getDriveFolder, listDriveItems, prepareGoogleIdentityServices, requestDriveAccessToken, revokeDriveAccessToken } from './googleDrive';
+import type { DriveItem } from './googleDrive';
 
 type Phase = 'setup' | 'exam' | 'result';
 type Confirm = null | 'section' | 'final';
+type DriveSyncFile = DriveItem;
+const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID?.trim() || '';
+const DRIVE_ROOT_FOLDER_ID = import.meta.env.VITE_GOOGLE_DRIVE_ROOT_FOLDER_ID?.trim() || '';
 const { fmt } = E;
 const letter = (i: number) => String.fromCharCode(65 + i);
 const palState = (a: AnswerState) => (a.selected !== null ? (a.marked ? 'answered-marked' : 'answered') : a.marked ? 'marked' : 'unanswered');
@@ -49,6 +54,18 @@ function App() {
   const [reviewSubject, setReviewSubject] = useState('All subjects');
   const [showExplanation, setShowExplanation] = useState<Record<number, boolean>>({});
   const fileRef = useRef<HTMLInputElement>(null);
+  const [driveToken, setDriveToken] = useState<string | null>(null);
+  const [driveExpiresAt, setDriveExpiresAt] = useState(0);
+  const [driveRootName, setDriveRootName] = useState('');
+  const [driveFolderId, setDriveFolderId] = useState(DRIVE_ROOT_FOLDER_ID);
+  const [drivePath, setDrivePath] = useState<DriveItem[]>([]);
+  const [driveItems, setDriveItems] = useState<DriveItem[]>([]);
+  const [driveBusy, setDriveBusy] = useState(false);
+  const [driveAuthPreparing, setDriveAuthPreparing] = useState(false);
+  const [driveMessage, setDriveMessage] = useState('');
+  const [driveSyncFile, setDriveSyncFile] = useState<DriveSyncFile | null>(null);
+  const driveSyncFileRef = useRef<DriveSyncFile | null>(driveSyncFile);
+  driveSyncFileRef.current = driveSyncFile;
 
   const totalRequested = useMemo(() => Object.values(counts).reduce((n, v) => n + (Number(v) || 0), 0), [counts]);
   const totalAvailable = subjects.reduce((n, s) => n + s.available, 0);
@@ -77,6 +94,61 @@ function App() {
     return () => { window.removeEventListener('pagehide', onHide); window.removeEventListener('beforeunload', onUnload); document.removeEventListener('fullscreenchange', onFs); };
   }, []);
   useEffect(() => { if (!toast) return; const id = window.setTimeout(() => setToast(''), 8000); return () => window.clearTimeout(id); }, [toast]);
+  useEffect(() => {
+    if (!GOOGLE_CLIENT_ID || !DRIVE_ROOT_FOLDER_ID) return;
+    let active = true;
+    setDriveAuthPreparing(true);
+    void prepareGoogleIdentityServices().catch(error => {
+      console.warn('[MockPractice Drive OAuth] Google Identity Services preload failed.', {
+        message: error instanceof Error ? error.message : 'Unknown error',
+      });
+    }).finally(() => { if (active) setDriveAuthPreparing(false); });
+    return () => { active = false; };
+  }, []);
+  useEffect(() => {
+    if (!driveToken || !driveExpiresAt) return;
+    const id = window.setTimeout(() => {
+      setDriveToken(null); setDriveExpiresAt(0); setDriveItems([]); setDrivePath([]); setDriveSyncFile(null); driveSyncFileRef.current = null;
+      setDriveMessage('Your Google Drive session expired. Sign in again to continue syncing.');
+    }, Math.max(0, driveExpiresAt - Date.now()));
+    return () => window.clearTimeout(id);
+  }, [driveToken, driveExpiresAt]);
+  useEffect(() => {
+    if (!driveToken) return;
+    let active = true;
+    const sync = async () => {
+      try {
+        const items = await listDriveItems(driveToken, driveFolderId);
+        if (active) setDriveItems(items);
+        if (!driveSyncFile) return;
+        const latest = await getDriveFile(driveToken, driveSyncFile.id);
+        if (latest.modifiedTime && latest.modifiedTime !== driveSyncFile.modifiedTime) {
+          if (!/\.(xlsx|xls)$/i.test(latest.name)) {
+            if (active) { setDriveSyncFile(null); setDriveMessage('The synced Drive file is no longer an Excel workbook.'); }
+            return;
+          }
+          const bytes = await downloadDriveFile(driveToken, latest.id);
+          const currentSync = driveSyncFileRef.current;
+          if (active && currentSync?.id === driveSyncFile.id && currentSync.modifiedTime === driveSyncFile.modifiedTime && processWorkbook(bytes, latest.name, latest)) {
+            setDriveMessage(`Automatically synced the updated Drive workbook “${latest.name}”.`);
+          }
+        }
+      } catch (error) {
+        if (!active) return;
+        if (error instanceof DriveApiError && error.status === 401) {
+          setDriveToken(null); setDriveExpiresAt(0); setDriveItems([]); setDrivePath([]); setDriveSyncFile(null); driveSyncFileRef.current = null;
+          setDriveMessage('Your Google Drive session expired. Sign in again to continue syncing.');
+        } else if (error instanceof DriveApiError && (error.status === 403 || error.status === 404)) {
+          setDriveItems([]); setDriveSyncFile(null); driveSyncFileRef.current = null;
+          setDriveMessage('Access to this Drive folder or file was denied. Check its sharing permissions.');
+        } else {
+          setDriveMessage(`Drive synchronization failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
+      }
+    };
+    const id = window.setInterval(() => { void sync(); }, 60000);
+    return () => { active = false; window.clearInterval(id); };
+  }, [driveToken, driveFolderId, driveSyncFile]);
 
   /* ------------------------------------------------------------ exam engine glue (all state transitions go through the ref) */
   function commit(next: ExamSession | null) { sessionRef.current = next; setSession(next); }
@@ -143,33 +215,113 @@ function App() {
   }, [phase]);
 
   /* ------------------------------------------------------------ setup actions */
+  function processWorkbook(data: ArrayBuffer, name: string, syncFile: DriveSyncFile | null = null) {
+    const wb = XLSX.read(data, { type: 'array' });
+    const sheets: RawSheet[] = wb.SheetNames.map((sheetName, i) => {
+      const ws = wb.Sheets[sheetName];
+      return { name: sheetName, hidden: (wb.Workbook?.Sheets?.[i]?.Hidden || 0) > 0, rowOffset: ws['!ref'] ? XLSX.utils.decode_range(ws['!ref']).s.r : 0, rows: XLSX.utils.sheet_to_json<unknown[]>(ws, { header: 1, defval: '', raw: false }) };
+    });
+    const { questions: parsed, report: rep } = E.parseSheets(sheets);
+    setReport(rep.issues.length || rep.warnings.length || rep.duplicates || rep.skippedSheets.length ? rep : null);
+    if (!parsed.length) { setNotice('No valid questions found. Check the worksheet rows and columns (details below).'); return false; }
+    const grouped = E.groupSubjects(parsed);
+    setQuestions(parsed); setSubjects(grouped); setCounts(Object.fromEntries(grouped.map(s => [s.name, '0']))); setFileName(name);
+    driveSyncFileRef.current = syncFile;
+    setDriveSyncFile(syncFile);
+    const extra = [rep.issues.length && `${rep.issues.length} row(s) skipped`, rep.duplicates && `${rep.duplicates} duplicate(s) removed`, rep.skippedSheets.length && `${rep.skippedSheets.length} worksheet(s) skipped`].filter(Boolean).join(', ');
+    setNotice(`Imported ${parsed.length} questions from ${grouped.length} worksheet(s).` + (extra ? ` ${extra}; see import details.` : ''));
+    return true;
+  }
   function importFile(file: File) {
     if (!/\.(xlsx|xls)$/i.test(file.name)) { setNotice('Please choose an .xlsx or .xls file.'); return; }
     if (questions.length && !window.confirm(`Replace the current question bank with “${file.name}”?`)) return;
     if (file.size > 25 * 1024 * 1024 && !window.confirm('This workbook is very large and may take a while to read. Continue?')) return;
-    setNotice(''); setImporting(true);
+    setNotice(''); setDriveMessage(''); setImporting(true);
     const reader = new FileReader();
     reader.onerror = () => { setImporting(false); setNotice('Could not read this file.'); };
     reader.onload = e => {
       window.setTimeout(() => { // let the "reading" state paint before the synchronous parse
         try {
-          const wb = XLSX.read(e.target?.result, { type: 'array' });
-          const sheets: RawSheet[] = wb.SheetNames.map((name, i) => {
-            const ws = wb.Sheets[name];
-            return { name, hidden: (wb.Workbook?.Sheets?.[i]?.Hidden || 0) > 0, rowOffset: ws['!ref'] ? XLSX.utils.decode_range(ws['!ref']).s.r : 0, rows: XLSX.utils.sheet_to_json<unknown[]>(ws, { header: 1, defval: '', raw: false }) };
-          });
-          const { questions: parsed, report: rep } = E.parseSheets(sheets);
-          setReport(rep.issues.length || rep.warnings.length || rep.duplicates || rep.skippedSheets.length ? rep : null);
-          if (!parsed.length) { setNotice('No valid questions found. Check the worksheet rows and columns (details below).'); return; }
-          const grouped = E.groupSubjects(parsed);
-          setQuestions(parsed); setSubjects(grouped); setCounts(Object.fromEntries(grouped.map(s => [s.name, '0']))); setFileName(file.name);
-          const extra = [rep.issues.length && `${rep.issues.length} row(s) skipped`, rep.duplicates && `${rep.duplicates} duplicate(s) removed`, rep.skippedSheets.length && `${rep.skippedSheets.length} worksheet(s) skipped`].filter(Boolean).join(', ');
-          setNotice(`Imported ${parsed.length} questions from ${grouped.length} worksheet(s).` + (extra ? ` ${extra}; see import details.` : ''));
+          const data = e.target?.result;
+          if (!(data instanceof ArrayBuffer)) throw new Error('Workbook data was not an ArrayBuffer.');
+          processWorkbook(data, file.name);
         } catch { setNotice('Could not read this workbook. Please upload a valid .xlsx or .xls file.'); }
         finally { setImporting(false); }
       }, 30);
     };
     reader.readAsArrayBuffer(file);
+  }
+  async function signInToDrive() {
+    if (!GOOGLE_CLIENT_ID || !DRIVE_ROOT_FOLDER_ID) {
+      setDriveMessage('Google Drive is not configured. Set VITE_GOOGLE_CLIENT_ID and VITE_GOOGLE_DRIVE_ROOT_FOLDER_ID; manual uploads are still available.');
+      return;
+    }
+    setDriveBusy(true); setDriveMessage('');
+    try {
+      const auth = await requestDriveAccessToken(GOOGLE_CLIENT_ID);
+      const root = await getDriveFolder(auth.token, DRIVE_ROOT_FOLDER_ID);
+      const items = await listDriveItems(auth.token, root.id);
+      setDriveToken(auth.token); setDriveExpiresAt(Date.now() + auth.expiresIn * 1000);
+      setDriveRootName(root.name); setDriveFolderId(root.id); setDrivePath([]); setDriveItems(items);
+      setDriveMessage('');
+    } catch (error) {
+      if (error instanceof GoogleAuthCancelledError) {
+        setDriveMessage('Google sign-in was cancelled before Google returned an access token. No Drive session was started; if you completed authorization, try again.');
+      } else if (error instanceof DriveApiError && (error.status === 403 || error.status === 404)) {
+        setDriveMessage('Access denied: this Google account cannot access the configured MockPractice root folder.');
+      } else if (error instanceof DriveApiError && error.status === 400) {
+        setDriveMessage('Google Drive configuration error: the configured MockPractice root ID must point to a folder.');
+      } else {
+        setDriveMessage(`Google Drive sign-in failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      }
+    } finally { setDriveBusy(false); }
+  }
+  async function openDriveFolder(folder: DriveItem, path: DriveItem[]) {
+    if (!driveToken) return;
+    setDriveBusy(true); setDriveMessage('');
+    try {
+      const items = await listDriveItems(driveToken, folder.id);
+      setDriveFolderId(folder.id); setDrivePath(path); setDriveItems(items);
+    } catch (error) {
+      setDriveItems([]);
+      setDriveMessage(error instanceof DriveApiError && (error.status === 403 || error.status === 404)
+        ? 'Access denied: your account cannot read this Drive folder.'
+        : `Could not open this Drive folder: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    } finally { setDriveBusy(false); }
+  }
+  async function importDriveWorkbook(file: DriveItem) {
+    if (!driveToken || !/\.(xlsx|xls)$/i.test(file.name)) return;
+    if (questions.length && !window.confirm(`Replace the current question bank with “${file.name}”?`)) return;
+    setImporting(true); setDriveBusy(true); setDriveMessage(''); setNotice('');
+    try {
+      const bytes = await downloadDriveFile(driveToken, file.id);
+      if (processWorkbook(bytes, file.name, file)) setDriveMessage(`Imported “${file.name}”. Changes will sync automatically while you are signed in.`);
+    } catch (error) {
+      if (error instanceof DriveApiError && error.status === 401) {
+        setDriveToken(null); setDriveExpiresAt(0); setDriveItems([]); setDrivePath([]); setDriveSyncFile(null); driveSyncFileRef.current = null;
+        setDriveMessage('Your Google Drive session expired. Sign in again to continue.');
+      } else if (error instanceof DriveApiError && (error.status === 403 || error.status === 404)) {
+        setDriveItems(items => items.filter(item => item.id !== file.id));
+        if (driveSyncFileRef.current?.id === file.id) {
+          setDriveSyncFile(null); driveSyncFileRef.current = null;
+        }
+        setDriveMessage('Access denied: your Google account cannot read this Excel file.');
+      } else {
+        setDriveMessage(`Could not download this Drive file: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      }
+    } finally { setImporting(false); setDriveBusy(false); }
+  }
+  async function signOutOfDrive() {
+    const token = driveToken;
+    setDriveToken(null); setDriveExpiresAt(0); setDriveItems([]); setDrivePath([]); setDriveSyncFile(null); driveSyncFileRef.current = null;
+    if (token) {
+      try {
+        await revokeDriveAccessToken(token);
+        setDriveMessage('Signed out of Google Drive.');
+      } catch {
+        setDriveMessage('Signed out of this app. Google token revocation could not be confirmed.');
+      }
+    }
   }
   function updateCount(name: string, value: string) {
     const numeric = value === '' ? '' : String(Math.max(0, Math.floor(Number(value) || 0)));
@@ -200,7 +352,7 @@ function App() {
   function clearEverything() {
     if (phase === 'exam') return;
     if (!window.confirm('Clear this browser’s saved question bank and test history?')) return;
-    E.clearStore(); setQuestions([]); setSubjects([]); setCounts({}); setSectionMinutes({}); setHistory([]); setFileName(''); setReport(null); reset();
+    E.clearStore(); setQuestions([]); setSubjects([]); setCounts({}); setSectionMinutes({}); setHistory([]); setFileName(''); setReport(null); setDriveSyncFile(null); driveSyncFileRef.current = null; reset();
   }
 
   /* ------------------------------------------------------------ export */
@@ -318,7 +470,24 @@ function App() {
       {phase === 'setup' && <>
         <section className="welcome"><div><div className="eyebrow">YOUR PERSONAL EXAM ROOM</div><h1>Prepare smarter.<br /><em>Perform better.</em></h1><p>Turn your Excel question bank into a timed, section-wise, shuffled mock test — no account, no server, no database.</p></div><div className="hero-art"><div className="hero-sheet"><FileSpreadsheet size={36} /><div className="sheet-lines"><i /><i /><i /><i /></div><b> XLSX</b></div><div className="float-check"><CheckCircle2 size={21} /></div><div className="float-clock"><Clock3 size={22} /></div></div></section>
         <div className="setup-grid">
-          <section className="panel upload-panel"><div className="section-heading"><div className="step">01</div><div><h2>Upload question bank</h2><p>Choose an Excel workbook (.xlsx or .xls)</p></div></div>
+          <section className="panel upload-panel"><div className="section-heading"><div className="step">01</div><div><h2>Choose a question-bank source</h2><p>Google Drive is optional; manual upload never requires login.</p></div></div>
+            <div className="source-options">
+              <div className="source-option"><div className="source-option-title"><Cloud size={18} /><b>Google Drive</b><span>Optional</span></div><p>Browse shared exam folders and sync Excel changes while signed in.</p><button className="secondary-button" disabled={driveBusy || (!driveToken && driveAuthPreparing)} onClick={driveToken ? () => { void signOutOfDrive(); } : () => { void signInToDrive(); }}>{driveToken ? <><LogOut size={16} /> Sign out of Google</> : driveAuthPreparing ? <><RefreshCw size={16} /> Preparing Google sign-in…</> : <><Cloud size={16} /> Sign in with Google</>}</button></div>
+              <div className="source-option"><div className="source-option-title"><Upload size={18} /><b>Upload Excel</b><span>No login</span></div><p>Continue without signing into Google. Your workbook stays in this browser.</p><button className="secondary-button" onClick={() => fileRef.current?.click()}><Upload size={16} /> Upload Excel</button></div>
+            </div>
+            {driveMessage && <div className="notice drive-notice" role="status"><AlertCircle size={16} />{driveMessage}</div>}
+            {driveToken && <section className="drive-browser" aria-label="Google Drive files">
+              <div className="drive-browser-heading"><div><h3><Cloud size={17} /> {driveRootName || 'Google Drive'}</h3><p>Drive access is read-only. File access is checked by Google for this account.</p></div><span className="sync-label"><RefreshCw size={13} /> Auto-sync every 60s</span></div>
+              <nav className="drive-breadcrumbs" aria-label="Drive folders"><button onClick={() => { void openDriveFolder({ id: DRIVE_ROOT_FOLDER_ID, name: driveRootName, mimeType: 'application/vnd.google-apps.folder' }, []); }}>{driveRootName || 'Root folder'}</button>{drivePath.map((folder, index) => <span key={folder.id}><ChevronRight size={13} /><button onClick={() => { void openDriveFolder(folder, drivePath.slice(0, index + 1)); }}>{folder.name}</button></span>)}</nav>
+              {driveBusy && <div className="drive-loading"><RefreshCw size={15} /> Loading Drive…</div>}
+              <div className="drive-items">
+                {driveItems.filter(item => item.mimeType === 'application/vnd.google-apps.folder').map(folder => <button className="drive-item" key={folder.id} disabled={driveBusy} onClick={() => { void openDriveFolder(folder, [...drivePath, folder]); }}><Folder size={17} /><span>{folder.name}</span><ChevronRight size={15} /></button>)}
+                {driveItems.filter(item => /\.(xlsx|xls)$/i.test(item.name)).map(file => <button className="drive-item drive-file" key={file.id} disabled={driveBusy || importing} onClick={() => { void importDriveWorkbook(file); }}><FileSpreadsheet size={17} /><span>{file.name}</span><small>{file.modifiedTime ? new Date(file.modifiedTime).toLocaleDateString() : 'Excel workbook'}</small><Download size={15} /></button>)}
+                {!driveBusy && driveItems.filter(item => item.mimeType === 'application/vnd.google-apps.folder' || /\.(xlsx|xls)$/i.test(item.name)).length === 0 && <p className="drive-empty">No exam folders or Excel files in this folder.</p>}
+              </div>
+              {driveSyncFile && <p className="drive-sync-file">Automatically syncing: {driveSyncFile.name}</p>}
+            </section>}
+            <div className="manual-upload-heading"><div className="step">02</div><div><h2>Upload Excel — Continue without login</h2><p>Choose an Excel workbook (.xlsx or .xls)</p></div></div>
             <div className={`dropzone ${questions.length ? 'has-file' : ''}`} onDragOver={e => e.preventDefault()} onDrop={e => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) importFile(f); }} onClick={() => fileRef.current?.click()}>
               <input ref={fileRef} type="file" accept=".xlsx,.xls" hidden onChange={e => { const f = e.target.files?.[0]; if (f) importFile(f); e.currentTarget.value = ''; }} />
               {questions.length ? <><div className="file-badge"><FileSpreadsheet size={25} /></div><b>{fileName}</b><span>{questions.length} questions imported · {subjects.length} subjects detected</span><button className="text-button" onClick={e => { e.stopPropagation(); fileRef.current?.click(); }}>Replace workbook</button></> : <><div className="upload-circle"><Upload size={23} /></div><b>Drop your Excel file here</b><span>or click to browse from your device</span><small>Subject names are read from worksheet tabs</small></>}
@@ -334,7 +503,7 @@ function App() {
             </details>}
             {subjects.length > 0 && <div className="detected"><div className="detected-title">Detected worksheets <span>{totalAvailable} total questions</span></div>{subjects.map(s => <div className="subject-row" key={s.name}><div className="subject-dot" /><b>{s.name}</b><span>{s.available} questions</span></div>)}</div>}
           </section>
-          <section className="panel config-panel"><div className="section-heading"><div className="step">02</div><div><h2>Configure your test</h2><p>Set question count and exam rules</p></div></div>
+          <section className="panel config-panel"><div className="section-heading"><div className="step">03</div><div><h2>Configure your test</h2><p>Set question count and exam rules</p></div></div>
             {subjects.length === 0 ? <div className="empty-config"><div><Shuffle size={25} /></div><b>Your subjects will appear here</b><span>Upload an Excel workbook to configure the test.</span></div> : <>
               <div className="field-label">QUESTIONS PER SUBJECT <span>{timingMode === 'section' ? 'Count and time for each section' : 'Enter each count manually'}</span></div>
               <div className="count-list">{subjects.map(s => <div className="count-row" key={s.name}><div className="subject-name"><span className="subject-dot" /><span>{s.name}</span><small>Max {s.available}</small></div>
